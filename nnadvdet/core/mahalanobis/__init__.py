@@ -1,0 +1,1 @@
+from .mahalanobis import MahalanobisDetector

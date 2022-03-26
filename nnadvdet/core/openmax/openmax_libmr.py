@@ -1,32 +1,42 @@
 import libmr
+from tqdm import tqdm
 import numpy as np
 import scipy.spatial.distance as spd
-from ..detector import AdverseDetector
+from nnadvdet.core.detector import AdverseDetector
+from loguru import logger
 
 
 class OpenmaxLibmr(AdverseDetector):
     def __init__(self, config):
         AdverseDetector.__init__(self, config)
+        self.weibull_model = None
+        self.mavs = None
+        if 'tail_length' in config:
+            self.tail_length = config['tail_length']
+        else:
+            self.tail_length = 20
 
     @staticmethod
     def compute_mav_distances(activations, predictions, true_labels, num_classes):
         """
         Calculates the mean activation vector (MAV) for each class and the distance to the mav for each vector.
 
-        :param num_classes: number of classes in labels
+        :param num_classes: number of classes in labels.
         :param activations: logits for each image.
         :param predictions: predicted label for each image.
         :param true_labels: true label for each image.
         :return: MAV and euclidean-cosine distance to each vector.
         """
+        logger.info('Calculates the mean activation vector')
         correct_activations = list()
         mean_activations = list()
         eucos_dist = list()
         # eucos_dist = np.zeros(true_labels.shape[1])
+        pbar = tqdm(total=num_classes)
 
         for cl in range(num_classes):
             # Find correctly predicted samples and store activation vectors.
-            i = (np.argmax(true_labels, 1) == predictions)
+            i = (true_labels == predictions)
             i = i & (predictions == cl)
             act = activations[i, :]
             correct_activations.append(act)
@@ -35,14 +45,14 @@ class OpenmaxLibmr(AdverseDetector):
             mean_act = np.mean(act, axis=0)
             mean_activations.append(mean_act)
 
-            print(cl, len(act))
             eucos_dist_temp = np.zeros(len(act))
             # Compute all, for this class, correctly classified images' distance to the MAV.
             for col in range(len(act)):
                 eucos_dist_temp[col] = spd.euclidean(mean_act, act[col, :]) / 200. + spd.cosine(mean_act, act[col, :])
                 # print(eucos_dist[cl])
             eucos_dist.append(eucos_dist_temp)
-
+            pbar.update(1)
+        pbar.close()
         return mean_activations, eucos_dist
 
     @staticmethod
@@ -50,14 +60,15 @@ class OpenmaxLibmr(AdverseDetector):
         """
         Fits a Weibull model of the logit vectors farthest from the MAV.
 
-        :param num_classes: number of classes
+        :param num_classes: number of classes.
         :param eucos_dist: the euclidean-cosine distance from the MAV.
         :param mean_activations: mean activation vector (MAV).
         :param taillength:
         :return: weibull model.
         """
-
+        logger.info('Weibull tailfitting')
         weibull_model = {}
+        pbar = tqdm(total=num_classes)
         for cl in range(num_classes):
             weibull_model[str(cl)] = {}
             weibull_model[str(cl)]['eucos_distances'] = eucos_dist[cl]
@@ -71,15 +82,45 @@ class OpenmaxLibmr(AdverseDetector):
             # print(tailtofit, '\n')
             mr.fit_high(tailtofit, len(tailtofit))
             weibull_model[str(cl)]['weibull_model'] = mr
-
+            pbar.update(1)
+        pbar.close()
         return weibull_model
+
+    @staticmethod
+    def weibull_tailfitting_v2(activations, predictions, true_labels, num_classes, taillength=20):
+        """
+        1. Calculates the mean activation vector (MAV) for each class and the distance to the mav for each vector.
+        2. Fits a Weibull model of the logit vectors farthest from the MAV.
+        :param taillength: number of acts used for tail-fitting.
+        :param num_classes: number of classes in labels.
+        :param activations: logits for each image.
+        :param predictions: predicted label for each image.
+        :param true_labels: true label for each image.
+        :return: weibull models.
+        """
+        weibull_models = []
+        mavs = []
+        tp_samples = np.where(predictions == true_labels)[0]
+        tp_activations = activations[tp_samples]
+        tp_labels = true_labels[tp_samples]
+        for cl in range(num_classes):
+            act_cl = tp_activations[tp_labels == cl, :]
+            mean_act = np.mean(act_cl, axis=0)
+            eucos_dist = spd.cdist(act_cl, mean_act, 'euclidean') / 200. + spd.cdist(act_cl, mean_act, 'cosine')
+            mr = libmr.MR(verbose=True)
+            tailtofit = np.sort(eucos_dist)[-taillength:]
+            mr.fit_high(tailtofit, tailtofit.shape[0])
+            mavs.append(mean_act)
+            weibull_models.append(mr)
+
+        return weibull_models, mavs
 
     @staticmethod
     def compute_open_max_probability(openmax_known_score, openmax_unknown_score, num_classes):
         """
         Compute the OpenMax probability.
 
-        :param num_labels:
+        :param num_classes: number of categories.
         :param openmax_known_score: Weibull scores for known labels.
         :param openmax_unknown_score: Weibull scores for unknown unknowns.
         :return: OpenMax probability.
@@ -107,7 +148,7 @@ class OpenmaxLibmr(AdverseDetector):
         """
         Computes the OpenMax probabilities of an input image.
 
-        :param num_labels: number of labels
+        :param num_classes: number of categories.
         :param weibull_model: pre-computed Weibull model.
                               Dictionary with [class_labels]['euclidean distances', 'mean_vec', 'weibull_model']
         :param img_layer_act: activations in penultimate layer.
@@ -144,15 +185,26 @@ class OpenmaxLibmr(AdverseDetector):
         openmax_openset_logit = np.sum(openmax_penultimate_unknown)
 
         # Transform the recalibrated penultimate layer scores for the image into OpenMax probability.
-        openmax_probab = OpenmaxLibmr.compute_open_max_probability(openmax_closedset_logit, openmax_openset_logit, num_labels)
+        openmax_probab = OpenmaxLibmr.compute_open_max_probability(openmax_closedset_logit, openmax_openset_logit, num_classes)
 
         return openmax_probab
 
-    def build_detector(self, x_train: np.ndarray, pred_train: np.ndarray, label_train: np.ndarray):
+    def build_detector(self, x_train: list, pred_train: np.ndarray, label_train: np.ndarray):
+        assert len(x_train) == 1 and x_train[0].ndim == 2, 'ReliableBound only accept features from logits layer.'
+        logger.info('Openmax build start......')
+        x_train = x_train[0]
+        mean_activations, eucos_dist = self.compute_mav_distances(x_train, pred_train, label_train, self.config['num_classes'])
+        self.weibull_model = self.weibull_tailfitting(eucos_dist, mean_activations, self.config['num_classes'], self.tail_length)
+        self.mavs = mean_activations
+
+    def detect(self, x: np.ndarray, **kwargs):
+        x = x.reshape(-1)
+        assert x.shape[0] == self.config['num_classes'] and 'x_pred' in kwargs
+        open_prob = self.recalibrate_scores(self.weibull_model, x, self.config['num_classes'], self.config['num_classes'])
+        if np.argmax(open_prob) == self.config['num_classes']:
+            return 0
+        else:
+            return np.max(open_prob)
+
+    def batched_detect(self, x, **kwargs):
         raise Exception('Not Implemented.')
-
-    def detect(self, x):
-        pass
-
-    def batched_detect(self, x):
-        pass
